@@ -1,14 +1,20 @@
 import os
 import pandas as pd
 from PIL import Image
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, DataLoader
 import torch
 from torchvision import transforms
-from transformers import BertTokenizer
+from torchvision.models import resnet18
+from transformers import BertTokenizer, BertModel
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+from sklearn.metrics import f1_score
+from torch.utils.data._utils.collate import default_collate
 
 class MultimodalDataset(Dataset):
     def __init__(self, csv_path, image_folder, tokenizer, transform=None, is_train=True):
-        self.df = pd.read_csv(csv_path, sep=',')
+        self.df = pd.read_csv(csv_path, sep=',').head(20)
         self.image_folder = image_folder
         self.tokenizer = tokenizer
         self.transform = transform
@@ -26,7 +32,20 @@ class MultimodalDataset(Dataset):
 
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
+
+        # Check if the image name is missing
+        if pd.isna(row['Ids']) or not isinstance(row['Ids'], str):
+            print(f"Missing image name at index {idx}. Skipping...")
+            return None
+
         image_path = os.path.join(self.image_folder, row['Ids'])
+
+        # Check if the image file exists
+        if not os.path.exists(image_path):
+            print(f"Image file not found: {image_path}. Skipping...")
+            return None
+
+        # Load and transform the image
         image = Image.open(image_path).convert('RGB')
         if self.transform:
             image = self.transform(image)
@@ -34,7 +53,7 @@ class MultimodalDataset(Dataset):
         # Ensure text is a valid string
         text = row['OCR']
         if not isinstance(text, str):
-            text = ""  # Replace invalid or missing text with an empty string
+            text = ""
 
         encoding = self.tokenizer(
             text,
@@ -61,13 +80,6 @@ class MultimodalDataset(Dataset):
             return inputs, labels
 
         return inputs
-    
-
-
-######################
-import torch.nn as nn
-from torchvision.models import resnet18
-from transformers import BertModel
 
 class MultimodalClassifier(nn.Module):
     def __init__(self, text_model_name='bert-base-uncased'):
@@ -99,17 +111,12 @@ class MultimodalClassifier(nn.Module):
         outputs = [head(x) for head in self.heads]
         return outputs
 
-###################
-from torch.utils.data import DataLoader
-from sklearn.metrics import f1_score
-import torch.optim as optim
-import torch.nn.functional as F
-import torch
-
 def train(model, dataloader, optimizer, device):
     model.train()
     total_loss = 0
     for batch in dataloader:
+        if batch is None:  # Skip empty batches
+            continue
         inputs, labels = batch
         image = inputs['image'].to(device)
         input_ids = inputs['input_ids'].to(device)
@@ -127,8 +134,6 @@ def train(model, dataloader, optimizer, device):
         total_loss += loss.item()
     return total_loss / len(dataloader)
 
-
-##################################
 def predict(model, dataloader, device):
     model.eval()
     all_preds = []
@@ -136,6 +141,8 @@ def predict(model, dataloader, device):
 
     with torch.no_grad():
         for inputs in dataloader:
+            if inputs is None:  # Skip invalid batches
+                continue
             image = inputs['image'].to(device)
             input_ids = inputs['input_ids'].to(device)
             attention_mask = inputs['attention_mask'].to(device)
@@ -153,19 +160,17 @@ def save_submission(ids, preds, output_file='submission.csv'):
     df.insert(0, 'Ids', ids)
     df.to_csv(output_file, index=False)
 
-
-
-
-
-
-########################
-from transformers import BertTokenizer
-from torchvision import transforms
+# Custom collate function to handle None values
+def custom_collate(batch):
+    batch = [item for item in batch if item is not None]
+    if len(batch) == 0:
+        return None
+    return default_collate(batch)
 
 # Config
-csv_path = 'Bangla_train_2025/Bangla_train_data.csv'         # Your train CSV/TSV
-test_csv = 'Bangla_test_2025/bengali_test_data_wo_label.csv'          # For submission
-image_folder = 'Bangla_train_2025/Bangla_train_images/'       # Folder with images
+csv_path = 'Bangla_train_2025/Bangla_train_data.csv'
+test_csv = 'Bangla_test_2025/bengali_test_data_wo_label.csv'
+image_folder = 'Bangla_train_2025/Bangla_train_images/'
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
 batch_size = 16
@@ -178,10 +183,10 @@ transform = transforms.Compose([
 
 # Datasets and loaders
 train_dataset = MultimodalDataset(csv_path, image_folder, tokenizer, transform)
-train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=custom_collate)
 
 test_dataset = MultimodalDataset(test_csv, image_folder, tokenizer, transform, is_train=False)
-test_loader = DataLoader(test_dataset, batch_size=batch_size)
+test_loader = DataLoader(test_dataset, batch_size=batch_size, collate_fn=custom_collate)
 
 # Model & optimizer
 model = MultimodalClassifier().to(device)
