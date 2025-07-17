@@ -14,7 +14,7 @@ from torch.utils.data._utils.collate import default_collate
 
 class MultimodalDataset(Dataset):
     def __init__(self, csv_path, image_folder, tokenizer, transform=None, is_train=True):
-        self.df = pd.read_csv(csv_path, sep=',').head(20)
+        self.df = pd.read_csv(csv_path, sep=',')
         self.image_folder = image_folder
         self.tokenizer = tokenizer
         self.transform = transform
@@ -188,17 +188,39 @@ train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, co
 test_dataset = MultimodalDataset(test_csv, image_folder, tokenizer, transform, is_train=False)
 test_loader = DataLoader(test_dataset, batch_size=batch_size, collate_fn=custom_collate)
 
-# Model & optimizer
-model = MultimodalClassifier().to(device)
-optimizer = optim.Adam(model.parameters(), lr=2e-5)
+#####################################
+# Testing the dataset
 
-# Train
-for epoch in range(5):
-    loss = train(model, train_loader, optimizer, device)
-    print(f"Epoch {epoch+1}: Loss = {loss:.4f}")
+for i in range(5):
+    sample = train_dataset[i]
+    
+    if sample is None:
+        print(f"Sample {i} is None (missing image or bad data). Skipping...")
+        continue
 
-# Predict
-ids, preds = predict(model, test_loader, device)
+    inputs, labels = sample
 
-# Save CSV
-save_submission(ids, preds)
+    print(f"\n--- Sample {i} ---")
+    print("Image ID:", inputs['id'])
+    print("Image Tensor Shape:", inputs['image'].shape)
+    print("Input IDs (first 10):", inputs['input_ids'][:10].tolist())
+    print("Attention Mask (first 10):", inputs['attention_mask'][:10].tolist())
+    print("Labels:", labels.tolist())
+
+################################################
+
+
+# # Model & optimizer
+# model = MultimodalClassifier().to(device)
+# optimizer = optim.Adam(model.parameters(), lr=2e-5)
+
+# # Train
+# for epoch in range(5):
+#     loss = train(model, train_loader, optimizer, device)
+#     print(f"Epoch {epoch+1}: Loss = {loss:.4f}")
+
+# # Predict
+# ids, preds = predict(model, test_loader, device)
+
+# # Save CSV
+# save_submission(ids, preds)
