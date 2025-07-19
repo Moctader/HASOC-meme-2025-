@@ -125,6 +125,7 @@ def train(model, dataloader, optimizer, device):
 
         optimizer.zero_grad()
         outputs = model(image, input_ids, attention_mask)
+        #print(f"Model outputs: {outputs}")
 
         loss = 0
         for i in range(4):  # One loss per task
@@ -142,7 +143,9 @@ def predict(model, dataloader, device):
     with torch.no_grad():
         for inputs in dataloader:
             if inputs is None:  # Skip invalid batches
+                print("Skipping invallid batch...........")
                 continue
+            print("process batch........")
             image = inputs['image'].to(device)
             input_ids = inputs['input_ids'].to(device)
             attention_mask = inputs['attention_mask'].to(device)
@@ -153,6 +156,7 @@ def predict(model, dataloader, device):
             all_preds.extend(preds)
             all_ids.extend(inputs['id'])
 
+    print(f"Total predictions: {len(all_preds)}")
     return all_ids, all_preds
 
 def save_submission(ids, preds, output_file='submission.csv'):
@@ -188,39 +192,22 @@ train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, co
 test_dataset = MultimodalDataset(test_csv, image_folder, tokenizer, transform, is_train=False)
 test_loader = DataLoader(test_dataset, batch_size=batch_size, collate_fn=custom_collate)
 
-#####################################
-# Testing the dataset
-
-for i in range(5):
-    sample = train_dataset[i]
-    
-    if sample is None:
-        print(f"Sample {i} is None (missing image or bad data). Skipping...")
-        continue
-
-    inputs, labels = sample
-
-    print(f"\n--- Sample {i} ---")
-    print("Image ID:", inputs['id'])
-    print("Image Tensor Shape:", inputs['image'].shape)
-    print("Input IDs (first 10):", inputs['input_ids'][:10].tolist())
-    print("Attention Mask (first 10):", inputs['attention_mask'][:10].tolist())
-    print("Labels:", labels.tolist())
 
 ################################################
 
 
-# # Model & optimizer
-# model = MultimodalClassifier().to(device)
-# optimizer = optim.Adam(model.parameters(), lr=2e-5)
+# Model & optimizer
+model = MultimodalClassifier().to(device)
+optimizer = optim.Adam(model.parameters(), lr=2e-5)
 
-# # Train
-# for epoch in range(5):
-#     loss = train(model, train_loader, optimizer, device)
-#     print(f"Epoch {epoch+1}: Loss = {loss:.4f}")
+# Train
+for epoch in range(1):
+    loss = train(model, train_loader, optimizer, device)
+    print(f"Epoch {epoch+1}: Loss = {loss:.4f}")
 
-# # Predict
-# ids, preds = predict(model, test_loader, device)
-
-# # Save CSV
-# save_submission(ids, preds)
+# Predict
+ids, preds = predict(model, train_loader, device)
+print(f"IDs: {ids}")
+print(f"Predictions: {preds}")
+# Save CSV
+save_submission(ids, preds)
