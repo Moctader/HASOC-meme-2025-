@@ -135,6 +135,7 @@ def predict():
         is_train=False
     )
     test_loader = DataLoader(test_dataset, batch_size=16, shuffle=False)
+    print(test_loader)
 
     # Inference loop
     submission_rows = []
@@ -158,11 +159,11 @@ def predict():
                 }
                 submission_rows.append(row)
 
-    # Save to CSV
+    # Save to  the CSV
     submission_df = pd.DataFrame(submission_rows)
     submission_df = submission_df[['Ids', 'Sentiment', 'Sarcasm', 'Vulgar', 'Abuse']]
     submission_df.to_csv(SUBMISSION_CSV, index=False)
-    print(f"✅ Submission file saved as {SUBMISSION_CSV}")
+    print(f"Submission file saved as {SUBMISSION_CSV}")
 
 
 # ------------------------------
