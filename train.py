@@ -1,12 +1,14 @@
 import os
 import torch
 import pandas as pd
-from tqdm import tqdm
 from PIL import Image
-from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms, models
 from transformers import BertTokenizer, BertModel
 import torch.nn as nn
+import pytorch_lightning as pl
+from torch.utils.data import Dataset, DataLoader
+from pytorch_lightning.callbacks.early_stopping import EarlyStopping
+from pytorch_lightning.callbacks.model_checkpoint import ModelCheckpoint
 
 # ------------------------------
 # Dataset
@@ -77,8 +79,8 @@ class MultimodalDataset(Dataset):
 # ------------------------------
 # Model
 # ------------------------------
-class MultimodalClassifier(nn.Module):
-    def __init__(self, text_model_name='bert-base-uncased', num_classes=[3, 2, 2, 2]):
+class MultimodalClassifier(pl.LightningModule):
+    def __init__(self, text_model_name='bert-base-uncased', num_classes=[3, 2, 2, 2], lr=2e-5):
         super().__init__()
         self.text_encoder = BertModel.from_pretrained(text_model_name)
         self.text_fc = nn.Linear(self.text_encoder.config.hidden_size, 256)
@@ -94,6 +96,9 @@ class MultimodalClassifier(nn.Module):
             nn.Linear(256, c) for c in num_classes
         ])
 
+        self.criterions = [nn.CrossEntropyLoss() for _ in range(len(num_classes))]
+        self.lr = lr
+
     def forward(self, image, input_ids, attention_mask):
         text_out = self.text_encoder(input_ids=input_ids, attention_mask=attention_mask)
         text_feat = self.text_fc(text_out.pooler_output)
@@ -107,19 +112,31 @@ class MultimodalClassifier(nn.Module):
         outputs = [clf(combined) for clf in self.classifiers]
         return outputs
 
+    def training_step(self, batch, batch_idx):
+        inputs, labels = batch
+        images = inputs['image']
+        input_ids = inputs['input_ids']
+        attention_mask = inputs['attention_mask']
+
+        outputs = self(images, input_ids, attention_mask)
+        loss = sum(self.criterions[i](outputs[i], labels[:, i]) for i in range(len(self.classifiers)))
+        self.log('train_loss', loss)
+        return loss
+
+    def configure_optimizers(self):
+        return torch.optim.Adam(self.parameters(), lr=self.lr)
+
 
 # ------------------------------
-# Training Loop
+# Training with PyTorch Lightning
 # ------------------------------
 def train():
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     CSV_PATH = "Bangla_train_2025/Bangla_train_data.csv"
     IMAGE_FOLDER = "Bangla_train_2025/Bangla_train_images"
-    MODEL_SAVE_PATH = "multimodal_model.pth"
-
-    EPOCHS = 1
     BATCH_SIZE = 16
     LR = 2e-5
+    MAX_EPOCHS = 50
 
     tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
     transform = transforms.Compose([
@@ -137,38 +154,34 @@ def train():
 
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
 
-    model = MultimodalClassifier().to(DEVICE)
+    model = MultimodalClassifier(lr=LR)
 
-    criterions = [
-        nn.CrossEntropyLoss() for _ in range(4)
-    ]
-    optimizer = torch.optim.Adam(model.parameters(), lr=LR)
+    # EarlyStopping Callback
+    early_stopping = EarlyStopping(
+        monitor='train_loss',
+        patience=5,
+        mode='min'
+    )
 
-    for epoch in range(EPOCHS):
-        model.train()
-        total_loss = 0
+    # ModelCheckpoint Callback
+    checkpoint_callback = ModelCheckpoint(
+        monitor='train_loss',
+        dirpath='checkpoints',
+        filename='best_model',
+        save_top_k=1,
+        mode='min'
+    )
 
-        for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}"):
-            inputs, labels = batch
-            images = inputs['image'].to(DEVICE)
-            input_ids = inputs['input_ids'].to(DEVICE)
-            attention_mask = inputs['attention_mask'].to(DEVICE)
-            labels = labels.to(DEVICE)
+    # Trainer
+    trainer = pl.Trainer(
+        max_epochs=MAX_EPOCHS,
+        callbacks=[early_stopping, checkpoint_callback],
+        accelerator='gpu' if torch.cuda.is_available() else 'cpu',
+        devices=1
+    )
 
-            optimizer.zero_grad()
-            outputs = model(images, input_ids, attention_mask)
-
-            loss = sum(criterions[i](outputs[i], labels[:, i]) for i in range(4))
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
-
-        avg_loss = total_loss / len(train_loader)
-        print(f"Epoch {epoch+1} Loss: {avg_loss:.4f}")
-
-    # Save model
-    torch.save(model.state_dict(), MODEL_SAVE_PATH)
-    print(f"Model saved to {MODEL_SAVE_PATH}")
+    # Train the model
+    trainer.fit(model, train_loader)
 
 
 # ------------------------------

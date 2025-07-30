@@ -3,3 +3,6 @@ Bangla_train_2025
 env
 multimodal_model.pth
 main.py
+main.py
+checkpoints
+lightning_logs

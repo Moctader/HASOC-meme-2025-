@@ -1,24 +1,27 @@
 import os
+import torch
 import pandas as pd
 from PIL import Image
-from torch.utils.data import Dataset, DataLoader
-import torch
-from torchvision import transforms
-from torchvision.models import resnet18
+from tqdm import tqdm
+from torchvision import transforms, models
 from transformers import BertTokenizer, BertModel
 import torch.nn as nn
-import torch.optim as optim
-import torch.nn.functional as F
-from sklearn.metrics import f1_score
-from torch.utils.data._utils.collate import default_collate
+import pytorch_lightning as pl
+from torch.utils.data import Dataset, DataLoader
+from pytorch_lightning.callbacks.early_stopping import EarlyStopping
+from pytorch_lightning.callbacks.model_checkpoint import ModelCheckpoint
 
+# ------------------------------
+# Dataset
+# ------------------------------
 class MultimodalDataset(Dataset):
     def __init__(self, csv_path, image_folder, tokenizer, transform=None, is_train=True):
-        self.df = pd.read_csv(csv_path, sep=',')
+        self.df = pd.read_csv(csv_path)
         self.image_folder = image_folder
         self.tokenizer = tokenizer
         self.transform = transform
         self.is_train = is_train
+
         self.label_maps = {
             'Sentiment': {'Negative': 0, 'Neutral': 1, 'Positive': 2},
             'Sarcasm': {'Non-Sarcastic': 0, 'Sarcastic': 1},
@@ -26,35 +29,28 @@ class MultimodalDataset(Dataset):
             'Abuse': {'Non-abusive': 0, 'Abusive': 1}
         }
 
+        self.df = self.df.dropna(subset=['Ids', 'OCR'])
+        self.df = self.df[self.df['Ids'].apply(lambda x: isinstance(x, str))].reset_index(drop=True)
+
     def __len__(self):
-        print(self.df.columns)
         return len(self.df)
 
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
+        image_id = row['Ids']
+        if not image_id.endswith(('.jpg', '.png')):
+            image_id += '.jpg'
 
-        # Check if the image name is missing
-        if pd.isna(row['Ids']) or not isinstance(row['Ids'], str):
-            print(f"Missing image name at index {idx}. Skipping...")
-            return None
+        image_path = os.path.join(self.image_folder, image_id)
+        try:
+            image = Image.open(image_path).convert('RGB')
+        except:
+            image = Image.new('RGB', (224, 224), color='black')
 
-        image_path = os.path.join(self.image_folder, row['Ids'])
-
-        # Check if the image file exists
-        if not os.path.exists(image_path):
-            print(f"Image file not found: {image_path}. Skipping...")
-            return None
-
-        # Load and transform the image
-        image = Image.open(image_path).convert('RGB')
         if self.transform:
             image = self.transform(image)
 
-        # Ensure text is a valid string
         text = row['OCR']
-        if not isinstance(text, str):
-            text = ""
-
         encoding = self.tokenizer(
             text,
             truncation=True,
@@ -66,8 +62,7 @@ class MultimodalDataset(Dataset):
         inputs = {
             'image': image,
             'input_ids': encoding['input_ids'].squeeze(0),
-            'attention_mask': encoding['attention_mask'].squeeze(0),
-            'id': row['Ids']
+            'attention_mask': encoding['attention_mask'].squeeze(0)
         }
 
         if self.is_train:
@@ -79,135 +74,198 @@ class MultimodalDataset(Dataset):
             ], dtype=torch.long)
             return inputs, labels
 
+        inputs['id'] = row['Ids']
         return inputs
 
-class MultimodalClassifier(nn.Module):
-    def __init__(self, text_model_name='bert-base-uncased'):
+
+# ------------------------------
+# Model
+# ------------------------------
+class MultimodalClassifier(pl.LightningModule):
+    def __init__(self, text_model_name='bert-base-uncased', num_classes=[3, 2, 2, 2], lr=2e-5):
         super().__init__()
-        # Text encoder
-        self.bert = BertModel.from_pretrained(text_model_name)
-        self.text_fc = nn.Linear(768, 256)
+        self.text_encoder = BertModel.from_pretrained(text_model_name)
+        self.text_fc = nn.Linear(self.text_encoder.config.hidden_size, 256)
 
-        # Image encoder
-        self.cnn = resnet18(pretrained=True)
-        self.cnn.fc = nn.Linear(self.cnn.fc.in_features, 256)
+        resnet = models.resnet18(pretrained=True)
+        self.image_encoder = nn.Sequential(*list(resnet.children())[:-1])
+        self.image_fc = nn.Linear(512, 256)
 
-        # Combined classifier for each task
-        self.combined_fc = nn.Linear(512, 256)
-        self.heads = nn.ModuleList([
-            nn.Linear(256, 3),  # Sentiment (3 classes)
-            nn.Linear(256, 2),  # Sarcasm
-            nn.Linear(256, 2),  # Vulgar
-            nn.Linear(256, 2),  # Abuse
+        self.fusion_fc = nn.Linear(512, 256)
+        self.dropout = nn.Dropout(0.3)
+
+        self.classifiers = nn.ModuleList([
+            nn.Linear(256, c) for c in num_classes
         ])
 
-    def forward(self, image, input_ids, attention_mask):
-        img_feat = self.cnn(image)  # [B, 256]
-        text_feat = self.bert(input_ids=input_ids, attention_mask=attention_mask).pooler_output  # [B, 768]
-        text_feat = self.text_fc(text_feat)  # [B, 256]
+        self.criterions = [nn.CrossEntropyLoss() for _ in range(len(num_classes))]
+        self.lr = lr
 
-        combined = torch.cat([img_feat, text_feat], dim=1)  # [B, 512]
-        x = self.combined_fc(combined)  # [B, 256]
-        outputs = [head(x) for head in self.heads]
+    def forward(self, image, input_ids, attention_mask):
+        text_out = self.text_encoder(input_ids=input_ids, attention_mask=attention_mask)
+        text_feat = self.text_fc(text_out.pooler_output)
+
+        img_feat = self.image_encoder(image).squeeze()
+        img_feat = self.image_fc(img_feat)
+
+        combined = torch.cat([text_feat, img_feat], dim=1)
+        combined = self.dropout(self.fusion_fc(combined))
+
+        outputs = [clf(combined) for clf in self.classifiers]
         return outputs
 
-def train(model, dataloader, optimizer, device):
-    model.train()
-    total_loss = 0
-    for batch in dataloader:
-        if batch is None:  # Skip empty batches
-            continue
+    def training_step(self, batch, batch_idx):
         inputs, labels = batch
-        image = inputs['image'].to(device)
-        input_ids = inputs['input_ids'].to(device)
-        attention_mask = inputs['attention_mask'].to(device)
-        labels = labels.to(device)
+        images = inputs['image']
+        input_ids = inputs['input_ids']
+        attention_mask = inputs['attention_mask']
 
-        optimizer.zero_grad()
-        outputs = model(image, input_ids, attention_mask)
-        #print(f"Model outputs: {outputs}")
+        outputs = self(images, input_ids, attention_mask)
+        loss = sum(self.criterions[i](outputs[i], labels[:, i]) for i in range(len(self.classifiers)))
+        self.log('train_loss', loss)
+        return loss
 
-        loss = 0
-        for i in range(4):  # One loss per task
-            loss += F.cross_entropy(outputs[i], labels[:, i])
-        loss.backward()
-        optimizer.step()
-        total_loss += loss.item()
-    return total_loss / len(dataloader)
+    def configure_optimizers(self):
+        return torch.optim.Adam(self.parameters(), lr=self.lr)
 
-def predict(model, dataloader, device):
+
+# ------------------------------
+# Training Function
+# ------------------------------
+def train():
+    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    CSV_PATH = "Bangla_train_2025/Bangla_train_data.csv"
+    IMAGE_FOLDER = "Bangla_train_2025/Bangla_train_images"
+    BATCH_SIZE = 16
+    LR = 2e-5
+    MAX_EPOCHS = 1
+
+    tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
+    transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor()
+    ])
+
+    train_dataset = MultimodalDataset(
+        csv_path=CSV_PATH,
+        image_folder=IMAGE_FOLDER,
+        tokenizer=tokenizer,
+        transform=transform,
+        is_train=True
+    )
+
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+
+    model = MultimodalClassifier(lr=LR)
+
+    # EarlyStopping Callback
+    early_stopping = EarlyStopping(
+        monitor='train_loss',
+        patience=5,
+        mode='min'
+    )
+
+    # ModelCheckpoint Callback
+    checkpoint_callback = ModelCheckpoint(
+        monitor='train_loss',
+        dirpath='checkpoints',
+        filename='best_model',
+        save_top_k=1,
+        mode='min'
+    )
+
+    # Trainer
+    trainer = pl.Trainer(
+        max_epochs=MAX_EPOCHS,
+        callbacks=[early_stopping, checkpoint_callback],
+        accelerator='gpu' if torch.cuda.is_available() else 'cpu',
+        devices=1
+    )
+
+    # Train the model
+    trainer.fit(model, train_loader)
+
+
+# ------------------------------
+# Inference Function
+# ------------------------------
+def predict():
+    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    MODEL_PATH = "checkpoints/best_model.ckpt"
+    TEST_CSV = "Bangla_test_2025/bengali_test_data_wo_label.csv"
+    IMAGE_FOLDER = "Bangla_test_2025/Bangla_test_images/"
+    SUBMISSION_CSV = "submission.csv"
+
+    # Label maps (reverse)
+    inv_label_maps = {
+        'Sentiment': {0: 'Negative', 1: 'Neutral', 2: 'Positive'},
+        'Sarcasm': {0: 'Non-Sarcastic', 1: 'Sarcastic'},
+        'Vulgar': {0: 'Non Vulgar', 1: 'Vulgar'},
+        'Abuse': {0: 'Non-abusive', 1: 'Abusive'}
+    }
+
+    tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+    transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor()
+    ])
+
+    # Load model using PyTorch Lightning's load_from_checkpoint
+    model = MultimodalClassifier.load_from_checkpoint(MODEL_PATH)
+    model.to(DEVICE)
     model.eval()
-    all_preds = []
-    all_ids = []
 
+    test_dataset = MultimodalDataset(
+        csv_path=TEST_CSV,
+        image_folder=IMAGE_FOLDER,
+        tokenizer=tokenizer,
+        transform=transform,
+        is_train=False
+    )
+    test_loader = DataLoader(test_dataset, batch_size=16, shuffle=False)
+
+    submission_rows = []
     with torch.no_grad():
-        for inputs in dataloader:
-            if inputs is None:  # Skip invalid batches
-                print("Skipping invallid batch...........")
-                continue
-            print("process batch........")
-            image = inputs['image'].to(device)
-            input_ids = inputs['input_ids'].to(device)
-            attention_mask = inputs['attention_mask'].to(device)
+        for batch in tqdm(test_loader, desc="Predicting"):
+            images = batch['image'].to(DEVICE)
+            input_ids = batch['input_ids'].to(DEVICE)
+            attention_mask = batch['attention_mask'].to(DEVICE)
+            ids = batch['id']
 
-            outputs = model(image, input_ids, attention_mask)
-            preds = [torch.argmax(o, dim=1).cpu().numpy() for o in outputs]
-            preds = list(zip(*preds))  # Transpose
-            all_preds.extend(preds)
-            all_ids.extend(inputs['id'])
+            outputs = model(images, input_ids, attention_mask)
+            preds = [torch.argmax(o, dim=1).cpu().tolist() for o in outputs]
 
-    print(f"Total predictions: {len(all_preds)}")
-    return all_ids, all_preds
+            for i in range(len(ids)):
+                row = {
+                    'Ids': ids[i],
+                    'Sentiment': inv_label_maps['Sentiment'][preds[0][i]],
+                    'Sarcasm': inv_label_maps['Sarcasm'][preds[1][i]],
+                    'Vulgar': inv_label_maps['Vulgar'][preds[2][i]],
+                    'Abuse': inv_label_maps['Abuse'][preds[3][i]]
+                }
+                submission_rows.append(row)
 
-def save_submission(ids, preds, output_file='submission.csv'):
-    df = pd.DataFrame(preds, columns=['Sentiment', 'Sarcasm', 'Vulgar', 'Abuse'])
-    df.insert(0, 'Ids', ids)
-    df.to_csv(output_file, index=False)
-
-# Custom collate function to handle None values
-def custom_collate(batch):
-    batch = [item for item in batch if item is not None]
-    if len(batch) == 0:
-        return None
-    return default_collate(batch)
-
-# Config
-csv_path = 'Bangla_train_2025/Bangla_train_data.csv'
-test_csv = 'Bangla_test_2025/bengali_test_data_wo_label.csv'
-image_folder = 'Bangla_train_2025/Bangla_train_images/'
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
-batch_size = 16
-
-# Transforms
-transform = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.ToTensor()
-])
-
-# Datasets and loaders
-train_dataset = MultimodalDataset(csv_path, image_folder, tokenizer, transform)
-train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=custom_collate)
-
-test_dataset = MultimodalDataset(test_csv, image_folder, tokenizer, transform, is_train=False)
-test_loader = DataLoader(test_dataset, batch_size=batch_size, collate_fn=custom_collate)
+    submission_df = pd.DataFrame(submission_rows)
+    submission_df = submission_df[['Ids', 'Sentiment', 'Sarcasm', 'Vulgar', 'Abuse']]
+    submission_df.to_csv(SUBMISSION_CSV, index=False)
+    print(f"Submission file saved as {SUBMISSION_CSV}")
 
 
-################################################
+# ------------------------------
+# Main Function
+# ------------------------------
+# ------------------------------
+# Main Function
+# ------------------------------
+def main():
+    print("Starting training...")
+    train()  
+    print("Training completed.")
+
+    print("Starting prediction...")
+    predict()  
+    print("Prediction completed.")
 
 
-# Model & optimizer
-model = MultimodalClassifier().to(device)
-optimizer = optim.Adam(model.parameters(), lr=2e-5)
-
-# Train
-for epoch in range(1):
-    loss = train(model, train_loader, optimizer, device)
-    print(f"Epoch {epoch+1}: Loss = {loss:.4f}")
-
-# Predict
-ids, preds = predict(model, train_loader, device)
-print(f"IDs: {ids}")
-print(f"Predictions: {preds}")
-# Save CSV
-save_submission(ids, preds)
+if __name__ == "__main__":
+    main()
